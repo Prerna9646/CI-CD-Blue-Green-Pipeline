@@ -4,7 +4,7 @@
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
-    "test": "echo 'Frontend tests simulated \u2705'"
+    "test": "echo 'Frontend tests simulated ✅'"
   },
   "dependencies": {
     "react": "^18.3.0",
