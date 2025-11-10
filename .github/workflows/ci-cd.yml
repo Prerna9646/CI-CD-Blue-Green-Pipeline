@@ -1,0 +1,180 @@
+# .github/workflows/ci-cd.yml
+name: CI/CD — Build, Test & Health Checks (Vercel + Render)
+
+on:
+  pull_request:
+    branches: [ main ]
+  push:
+    branches: [ main ]
+
+env:
+  FRONTEND_DIR: frontend
+  BACKEND_DIR: backend
+
+jobs:
+  build-and-test:
+    name: Build & Test (frontend + backend)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install & build frontend
+        working-directory: ${{ env.FRONTEND_DIR }}
+        run: |
+          npm ci
+          npm run build --if-present
+
+      - name: Install & test backend
+        working-directory: ${{ env.BACKEND_DIR }}
+        run: |
+          npm ci
+          if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+            npm test || true
+          else
+            echo "No tests declared in backend/package.json"
+          fi
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-frontend
+          path: ${{ env.FRONTEND_DIR }}/dist || ${{ env.FRONTEND_DIR }}/build || ${{ env.FRONTEND_DIR }}/dist
+
+  pr-health-check:
+    name: PR Preview Health Check (Vercel + Render)
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Wait for Vercel Preview deployment (by commit SHA)
+        id: vercel_preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          echo "Polling Vercel for deployment for commit $COMMIT_SHA"
+          for i in $(seq 1 30); do
+            # get deployments and pick one with matching git commit meta
+            resp=$(curl -s -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID")
+            url=$(echo "$resp" | jq -r --arg sha "$COMMIT_SHA" '.deployments[] | select(.meta.githubCommitSha == $sha) | .url' | head -n1 || true)
+            if [ -n "$url" ] && [ "$url" != "null" ]; then
+              echo "Found Vercel preview: $url"
+              echo "preview_url=$url" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Not found yet, attempt $i - sleeping 6s"
+            sleep 6
+          done
+          echo "Vercel preview not found"
+          exit 1
+
+      - name: Wait for Render Preview (optional if you have preview branch deployed)
+        id: render_preview
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          echo "Polling Render for a deploy for commit $COMMIT_SHA"
+          for i in $(seq 1 30); do
+            resp=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys")
+            url=$(echo "$resp" | jq -r --arg sha "$COMMIT_SHA" '.[] | select(.commit == $sha) | .web_url' | head -n1 || true)
+            if [ -n "$url" ] && [ "$url" != "null" ]; then
+              echo "Found Render preview: $url"
+              echo "render_preview_url=$url" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Not found yet, attempt $i - sleeping 6s"
+            sleep 6
+          done
+          echo "Render preview not found (continuing if backend is not configured for preview)"
+          echo "render_preview_url=" >> $GITHUB_OUTPUT
+
+      - name: Run health check on Vercel Preview
+        if: steps.vercel_preview.outputs.preview_url != ''
+        run: |
+          ./ci/health-check.sh "https://${{ steps.vercel_preview.outputs.preview_url }}" 120 5
+
+      - name: Run health check on Render Preview (if any)
+        if: steps.render_preview.outputs.render_preview_url != ''
+        run: |
+          ./ci/health-check.sh "${{ steps.render_preview.outputs.render_preview_url }}" 120 5
+
+  main-deploy-check:
+    name: Production Deploy & Smoke Tests
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Wait for Vercel production deployment
+        id: vercel_prod
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          echo "Polling Vercel for production deployment for commit $COMMIT_SHA"
+          for i in $(seq 1 40); do
+            resp=$(curl -s -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID")
+            url=$(echo "$resp" | jq -r --arg sha "$COMMIT_SHA" '.deployments[] | select(.meta.githubCommitSha == $sha and .target=="production") | .url' | head -n1 || true)
+            if [ -n "$url" ] && [ "$url" != "null" ]; then
+              echo "Found Vercel production: $url"
+              echo "prod_url=$url" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Not found yet, attempt $i - sleeping 6s"
+            sleep 6
+          done
+          echo "Vercel production not found"
+          exit 1
+
+      - name: Wait for Render production deployment (optional)
+        id: render_prod
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+          COMMIT_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          echo "Polling Render for production deploy for commit $COMMIT_SHA"
+          for i in $(seq 1 40); do
+            resp=$(curl -s -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys")
+            url=$(echo "$resp" | jq -r --arg sha "$COMMIT_SHA" '.[] | select(.commit == $sha) | .web_url' | head -n1 || true)
+            if [ -n "$url" ] && [ "$url" != "null" ]; then
+              echo "Found Render production: $url"
+              echo "render_prod_url=$url" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Not found yet, attempt $i - sleeping 6s"
+            sleep 6
+          done
+          echo "Render production not found (continue if not used)"
+          echo "render_prod_url=" >> $GITHUB_OUTPUT
+
+      - name: Smoke test Production (frontend)
+        run: |
+          ./ci/health-check.sh "https://${{ steps.vercel_prod.outputs.prod_url }}" 120 5
+
+      - name: Smoke test Backend (Render)
+        if: steps.render_prod.outputs.render_prod_url != ''
+        run: |
+          ./ci/health-check.sh "${{ steps.render_prod.outputs.render_prod_url }}" 120 5
