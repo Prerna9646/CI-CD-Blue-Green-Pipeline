@@ -25,22 +25,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
+          
+- name: Install & build frontend
+  working-directory: ${{ env.FRONTEND_DIR }}
+  run: |
+    npm install
+    npm run build --if-present
 
-      - name: Install & build frontend
-        working-directory: ${{ env.FRONTEND_DIR }}
-        run: |
-          npm ci
-          npm run build --if-present
+- name: Install & test backend
+  working-directory: ${{ env.BACKEND_DIR }}
+  run: |
+    npm install
+    if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
+      npm test || true
+    else
+      echo "No tests declared in backend/package.json"
+    fi
 
-      - name: Install & test backend
-        working-directory: ${{ env.BACKEND_DIR }}
-        run: |
-          npm ci
-          if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null 2>&1; then
-            npm test || true
-          else
-            echo "No tests declared in backend/package.json"
-          fi
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
